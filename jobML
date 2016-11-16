@@ -1,0 +1,120 @@
+package com.sparkProject
+import org.apache.log4j.{Level, Logger}
+import org.apache.spark.sql.{DataFrameReader, SparkSession}
+import org.apache.spark.ml.feature.VectorAssembler
+import org.apache.spark.ml.feature.StringIndexer
+import org.apache.spark.ml.classification.LogisticRegression
+import org.apache.spark.ml.evaluation.{BinaryClassificationEvaluator, MulticlassClassificationEvaluator}
+import org.apache.spark.ml.classification.BinaryLogisticRegressionSummary
+import org.apache.spark.ml.tuning.{TrainValidationSplit, ParamGridBuilder}
+import org.apache.spark.mllib.evaluation.MulticlassMetrics
+import org.apache.spark.ml.linalg.Vectors
+import org.apache.spark.sql.functions._
+
+
+/**
+  * Created by audrey on 28/10/16.
+  */
+object JobML {
+  def main(args: Array[String]): Unit = {
+
+    // SparkSession configuration
+    val spark = SparkSession
+      .builder
+      .appName("spark session TP_parisTech")
+      .getOrCreate()
+
+    val sc = spark.sparkContext
+
+    import spark.implicits._
+    val rootLogger = Logger.getRootLogger()
+    rootLogger.setLevel(Level.ERROR)
+
+
+    /********************************************************************************
+      *
+      *        TP 4
+      *
+      ********************************************************************************/
+
+    val df =spark
+      .read.parquet("/home/audrey/Bureau/cleanedDataFrame.parquet")
+      
+   /* on peut convertir le .parquet en .csv
+      df
+      .coalesce(1) // optional : regroup all data in ONE partition, so that results are printed in ONE file
+      // >>>> You should not do that in general, only when the data are small enough to fit in the memory of a single machine.
+      .write
+      .mode("overwrite")
+      .option("header", "true")
+      .csv("/home/audrey/Bureau/cleanedDataFrame1.csv")*/
+      
+    //enlever les colonnes koi_disposition et rowid
+    val dfcolumn = df.columns
+    val colX = dfcolumn.filter(x => !x.contains("koi_disposition") && !x.contains("rowid"))
+
+   // créer un vector assembler pour les features
+    val features = new VectorAssembler().setInputCols(colX).setOutputCol("features")
+    val df_fin = features.transform(df).select("features","koi_disposition")
+    df_fin.printSchema()
+    
+    //convertir les catégories de koi_disposition en 0 ou 1
+    val indexer = new StringIndexer().setInputCol("koi_disposition").setOutputCol("label")
+    val indexX = indexer.fit(df_fin).transform(df_fin)
+    indexX.select("label").show()
+    
+    //split du df en training (90%) et test(10%)
+    val Array(trainingData, testData) = indexX.randomSplit(Array(0.9,0.1))
+    trainingData.printSchema()
+
+    // definition de la régression logistique
+    val lr =new LogisticRegression()
+                .setElasticNetParam(1.0)
+                .setLabelCol("label")
+                .setFeaturesCol("features")
+                .setStandardization(true)  // to scale each feature of the model
+                .setFitIntercept(true)  // we want an affine regression (with false, it is a linear regression)
+                .setTol(1.0e-5)  // stop criterion of the algorithm based on its convergence
+                .setMaxIter(300)  // a security stop criterion to avoid infinite loops
+                
+
+    println("définition de la grille de paramètres")
+    val paramgrid = (-6.0 to 0 by 0.5 toArray).map(math.pow(10,_))
+    //construction de la grille des paramètres
+    val paramGrid = new ParamGridBuilder()
+      .addGrid(lr.regParam, paramgrid)
+      .build()
+
+    // on définit le nouveau modèle avec la grille des paramètres en  splittant à nouveau le training data
+    val cv = new TrainValidationSplit()
+        .setEstimator(lr)
+        .setEvaluator(new BinaryClassificationEvaluator)
+        .setEstimatorParamMaps(paramGrid)
+        .setTrainRatio(0.7)
+        
+     //on applique le modèle au training data  
+    val cvModel = cv.fit(trainingData)
+    
+    val results = cvModel.transform(testData.toDF).select("label","prediction").collect
+    
+    //on affiche la métrique du modèle
+    val metricsModel = cvModel.validationMetrics
+    val resumMetrics = sc.parallelize(paramgrid zip metricsModel).toDF("paramgrid","model")
+    println("Metrics du model")
+    resumMetrics.show()
+    
+    //on crée un DF avec la prédiction des data
+    val predictData = cvModel.transform(testData)
+    predictData.show()
+    
+    //on sauvegarde les data prédites dans un fichier .csv
+    predictData
+      .coalesce(1) // optional : regroup all data in ONE partition, so that results are printed in ONE file
+      // >>>> You should not do that in general, only when the data are small enough to fit in the memory of a single machine.
+      .write
+      .mode("overwrite")
+      .option("header", "true")
+      .csv("/home/audrey/Bureau/predictData.csv")
+
+  }
+}
